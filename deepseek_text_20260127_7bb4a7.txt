@@ -1,0 +1,106 @@
+
+## 🚀 **5. Create Your First Analysis Script**
+
+**`scripts/initial_analysis.py`:**
+```python
+#!/usr/bin/env python3
+"""
+Initial analysis of Arizona corporate network data.
+"""
+
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+def create_project_directories():
+    """Create all necessary project directories."""
+    dirs = [
+        'data/raw',
+        'data/processed',
+        'data/external',
+        'outputs/graphs',
+        'outputs/tables',
+        'outputs/reports',
+        'notebooks',
+        'src/parsers',
+        'src/analysis',
+        'src/visualization',
+        'src/utils',
+        'scripts'
+    ]
+    
+    for dir_path in dirs:
+        Path(dir_path).mkdir(parents=True, exist_ok=True)
+        print(f"Created: {dir_path}")
+    
+    print("\n✅ Project structure created successfully!")
+
+def sample_network_analysis():
+    """Create a sample network analysis to test setup."""
+    print("\n🔍 Testing network analysis setup...")
+    
+    # Create a simple test graph
+    G = nx.Graph()
+    
+    # Add Wyloge cluster
+    G.add_node("Florence Wyloge", type="person", cluster="wyloge")
+    G.add_node("N136TT LLC", type="company", cluster="wyloge")
+    G.add_node("ATHB Brokerage", type="company", cluster="wyloge")
+    G.add_edge("Florence Wyloge", "N136TT LLC", role="member")
+    G.add_edge("Florence Wyloge", "ATHB Brokerage", role="member")
+    
+    # Add Manoil cluster
+    G.add_node("Mark Manoil", type="person", cluster="manoil")
+    G.add_node("CPX LANDS", type="company", cluster="manoil")
+    G.add_edge("Mark Manoil", "CPX LANDS", role="agent")
+    
+    # Calculate basic metrics
+    print(f"Nodes: {G.number_of_nodes()}")
+    print(f"Edges: {G.number_of_edges()}")
+    print(f"Connected components: {nx.number_connected_components(G)}")
+    
+    # Visualize
+    plt.figure(figsize=(10, 8))
+    pos = nx.spring_layout(G, seed=42)
+    
+    # Color by cluster
+    colors = []
+    for node in G.nodes():
+        if G.nodes[node].get('cluster') == 'wyloge':
+            colors.append('lightblue')
+        elif G.nodes[node].get('cluster') == 'manoil':
+            colors.append('lightgreen')
+        else:
+            colors.append('gray')
+    
+    nx.draw(G, pos, node_color=colors, with_labels=True, node_size=2000, 
+            font_size=10, font_weight='bold')
+    
+    plt.title("Arizona Corporate Network (Sample)", fontsize=16)
+    plt.tight_layout()
+    
+    # Save the visualization
+    output_path = Path("outputs/graphs/sample_network.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"\n📊 Sample graph saved to: {output_path}")
+    
+    plt.show()
+    
+    return G
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Arizona Corporate Network Analysis - Setup Script")
+    print("=" * 60)
+    
+    # Create directories
+    create_project_directories()
+    
+    # Run sample analysis
+    sample_network_analysis()
+    
+    print("\n" + "=" * 60)
+    print("✅ Setup complete! Ready to analyze your data.")
+    print("=" * 60)

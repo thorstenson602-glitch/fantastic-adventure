@@ -1,0 +1,560 @@
+"""
+BACKDOOR INVESTIGATOR FRAMEWORK
+A modular system for public records research and connection mapping
+"""
+
+import requests
+import pandas as pd
+import time
+import json
+from bs4 import BeautifulSoup
+from typing import List, Dict, Optional, Set
+import logging
+from dataclasses import dataclass
+from urllib.parse import urljoin
+import sqlite3
+from contextlib import contextmanager
+
+# ==================== CONFIGURATION ====================
+@dataclass
+class InvestigatorConfig:
+    """Configuration for the investigation framework"""
+    rate_limit_delay: float = 2.0  # Seconds between requests
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    output_dir: str = "./investigation_data"
+    db_path: str = "./investigation.db"
+    
+    # Arizona-specific endpoints (update as needed)
+    ACC_SEARCH_URL: str = "https://ecorp.azcc.gov/BusinessSearch"
+    MARICOPA_ASSESSOR_URL: str = "https://mcassessor.maricopa.gov/"
+    ADRE_LICENSE_URL: str = "https://apps.azre.gov/publicdatabase/SearchIndividuals.aspx"
+
+# ==================== CORE DATA STRUCTURES ====================
+@dataclass
+class BusinessEntity:
+    """Represents a business entity found in records"""
+    name: str
+    entity_id: str
+    status: str
+    address: str
+    principals: List[str]
+    statutory_agent: str
+    formation_date: str
+    source: str
+    
+@dataclass
+class PropertyRecord:
+    """Represents a property record"""
+    address: str
+    owner_name: str
+    apn: str
+    assessed_value: float
+    property_type: str
+    year_built: int
+    sale_history: List[Dict]
+    
+@dataclass
+class Person:
+    """Represents an individual in the network"""
+    full_name: str
+    aliases: List[str]
+    business_roles: List[Dict]  # {entity_name: role, date: date}
+    professional_licenses: List[Dict]
+    addresses: List[str]
+
+# ==================== DATABASE MANAGER ====================
+class InvestigationDB:
+    """Manages persistent storage of investigation data"""
+    
+    def __init__(self, db_path: str):
+        self.conn = sqlite3.connect(db_path)
+        self._create_tables()
+        
+    def _create_tables(self):
+        """Initialize database schema"""
+        tables = [
+            """CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                entity_id TEXT UNIQUE,
+                status TEXT,
+                address TEXT,
+                statutory_agent TEXT,
+                formation_date TEXT,
+                source TEXT,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            """CREATE TABLE IF NOT EXISTS entity_principals (
+                id INTEGER PRIMARY KEY,
+                entity_id TEXT,
+                person_name TEXT,
+                role TEXT,
+                FOREIGN KEY (entity_id) REFERENCES entities(entity_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS properties (
+                id INTEGER PRIMARY KEY,
+                address TEXT,
+                apn TEXT UNIQUE,
+                owner_name TEXT,
+                owner_entity_id TEXT,
+                assessed_value REAL,
+                property_type TEXT,
+                year_built INTEGER,
+                last_sale_date TEXT,
+                last_sale_price REAL,
+                county TEXT,
+                FOREIGN KEY (owner_entity_id) REFERENCES entities(entity_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS people (
+                id INTEGER PRIMARY KEY,
+                full_name TEXT,
+                license_number TEXT,
+                license_type TEXT,
+                status TEXT,
+                business_address TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS connections (
+                id INTEGER PRIMARY KEY,
+                source_type TEXT,
+                source_id TEXT,
+                target_type TEXT,
+                target_id TEXT,
+                connection_type TEXT,
+                strength INTEGER DEFAULT 1,
+                notes TEXT
+            )"""
+        ]
+        
+        for table_sql in tables:
+            self.conn.execute(table_sql)
+        self.conn.commit()
+    
+    def save_entity(self, entity: BusinessEntity) -> bool:
+        """Save a business entity to database"""
+        try:
+            # Insert entity
+            self.conn.execute("""
+                INSERT OR REPLACE INTO entities 
+                (name, entity_id, status, address, statutory_agent, formation_date, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (entity.name, entity.entity_id, entity.status, entity.address, 
+                  entity.statutory_agent, entity.formation_date, entity.source))
+            
+            # Insert principals
+            for principal in entity.principals:
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO entity_principals (entity_id, person_name)
+                    VALUES (?, ?)
+                """, (entity.entity_id, principal))
+            
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Error saving entity: {e}")
+            return False
+    
+    def find_connected_entities(self, person_name: str) -> List[Dict]:
+        """Find all entities connected to a person"""
+        cursor = self.conn.execute("""
+            SELECT e.name, e.entity_id, e.status, e.address
+            FROM entities e
+            JOIN entity_principals ep ON e.entity_id = ep.entity_id
+            WHERE ep.person_name LIKE ?
+        """, (f"%{person_name}%",))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def get_address_cluster(self, address: str) -> List[Dict]:
+        """Find all entities sharing an address"""
+        cursor = self.conn.execute("""
+            SELECT name, entity_id, status, statutory_agent
+            FROM entities
+            WHERE address LIKE ?
+        """, (f"%{address}%",))
+        
+        return [dict(row) for row in cursor.fetchall()]
+
+# ==================== WEB SCRAPERS ====================
+class BaseScraper:
+    """Base class for web scrapers with rate limiting"""
+    
+    def __init__(self, config: InvestigatorConfig):
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': config.user_agent})
+        self.last_request_time = 0
+        
+    def _rate_limit(self):
+        """Enforce rate limiting between requests"""
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.config.rate_limit_delay:
+            time.sleep(self.config.rate_limit_delay - elapsed)
+        self.last_request_time = time.time()
+    
+    def fetch_page(self, url: str, params: Optional[Dict] = None) -> Optional[BeautifulSoup]:
+        """Fetch and parse a webpage with error handling"""
+        try:
+            self._rate_limit()
+            response = self.session.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            return BeautifulSoup(response.content, 'html.parser')
+        except Exception as e:
+            logging.error(f"Error fetching {url}: {e}")
+            return None
+
+class ACCScraper(BaseScraper):
+    """Scraper for Arizona Corporation Commission"""
+    
+    def search_by_principal(self, principal_name: str) -> List[BusinessEntity]:
+        """
+        Search ACC for entities by principal name
+        Note: This is a template - actual selectors need to be determined
+        by inspecting the ACC website's current structure
+        """
+        entities = []
+        
+        # This would need to be adapted to the actual ACC search form
+        search_params = {
+            'search_type': 'principal',
+            'search_term': principal_name,
+            # Add other required form parameters
+        }
+        
+        soup = self.fetch_page(self.config.ACC_SEARCH_URL, search_params)
+        if not soup:
+            return entities
+        
+        # EXAMPLE PARSING LOGIC - NEEDS ACTUAL SELECTORS
+        # Typically you'd look for table rows or specific divs
+        # result_rows = soup.select('table.search-results tr')
+        
+        # Mock entity creation for demonstration
+        # entities.append(BusinessEntity(
+        #     name="EXAMPLE LLC",
+        #     entity_id="L12345678",
+        #     status="Active",
+        #     address="123 Main St, Phoenix, AZ",
+        #     principals=["John Doe", "Jane Smith"],
+        #     statutory_agent="Mark L. Manoil",
+        #     formation_date="2020-01-15",
+        #     source="ACC"
+        # ))
+        
+        return entities
+    
+    def search_by_entity_name(self, entity_name: str) -> Optional[BusinessEntity]:
+        """Search for a specific entity by name"""
+        # Implementation similar to above
+        pass
+
+class AssessorScraper(BaseScraper):
+    """Scraper for county assessor websites"""
+    
+    def search_by_owner(self, owner_name: str, county: str = "maricopa") -> List[PropertyRecord]:
+        """
+        Search property records by owner name
+        """
+        properties = []
+        
+        # County-specific logic
+        if county.lower() == "maricopa":
+            search_url = f"{self.config.MARICOPA_ASSESSOR_URL}/search"
+            # Actual implementation would need to parse the assessor's site structure
+            
+        return properties
+    
+    def search_by_apn(self, apn: str, county: str = "maricopa") -> Optional[PropertyRecord]:
+        """Search property by APN"""
+        pass
+
+# ==================== INVESTIGATION ENGINE ====================
+class BackdoorInvestigator:
+    """Main investigation engine implementing the methodology"""
+    
+    def __init__(self, config: Optional[InvestigatorConfig] = None):
+        self.config = config or InvestigatorConfig()
+        self.db = InvestigationDB(self.config.db_path)
+        self.acc_scraper = ACCScraper(self.config)
+        self.assessor_scraper = AssessorScraper(self.config)
+        
+        # Investigation state
+        self.known_entities: Set[str] = set()
+        self.known_people: Set[str] = set()
+        self.address_clusters: Dict[str, List[str]] = {}
+        
+        # Set up logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(f"{self.config.output_dir}/investigation.log"),
+                logging.StreamHandler()
+            ]
+        )
+    
+    def phase1_foundation(self, entry_point: str) -> Dict:
+        """
+        Phase 1: Foundation - Start from a known point (name or entity)
+        """
+        logging.info(f"=== PHASE 1: FOUNDATION - Starting from '{entry_point}' ===")
+        
+        results = {
+            'entities': [],
+            'people': [],
+            'addresses': []
+        }
+        
+        # Try as person name first
+        person_entities = self.acc_scraper.search_by_principal(entry_point)
+        
+        # Try as entity name
+        entity_result = self.acc_scraper.search_by_entity_name(entry_point)
+        if entity_result:
+            person_entities.append(entity_result)
+        
+        for entity in person_entities:
+            # Save to database
+            self.db.save_entity(entity)
+            self.known_entities.add(entity.entity_id)
+            
+            # Extract people
+            for principal in entity.principals:
+                self.known_people.add(principal)
+                results['people'].append(principal)
+            
+            # Track address
+            if entity.address:
+                results['addresses'].append(entity.address)
+                if entity.address not in self.address_clusters:
+                    self.address_clusters[entity.address] = []
+                self.address_clusters[entity.address].append(entity.name)
+            
+            results['entities'].append({
+                'name': entity.name,
+                'id': entity.entity_id,
+                'agent': entity.statutory_agent
+            })
+        
+        return results
+    
+    def phase2_asset_mapping(self, entity_ids: List[str]) -> Dict:
+        """
+        Phase 2: Asset Mapping - Find properties owned by entities
+        """
+        logging.info("=== PHASE 2: ASSET MAPPING ===")
+        
+        results = {
+            'properties': [],
+            'entity_assets': {}
+        }
+        
+        for entity_id in entity_ids:
+            # Get entity details from DB
+            cursor = self.db.conn.execute(
+                "SELECT name FROM entities WHERE entity_id = ?", 
+                (entity_id,)
+            )
+            entity_row = cursor.fetchone()
+            
+            if entity_row:
+                entity_name = entity_row[0]
+                properties = self.assessor_scraper.search_by_owner(entity_name)
+                
+                results['entity_assets'][entity_name] = len(properties)
+                
+                for prop in properties:
+                    results['properties'].append({
+                        'owner': entity_name,
+                        'address': prop.address,
+                        'apn': prop.apn,
+                        'value': prop.assessed_value
+                    })
+        
+        return results
+    
+    def phase3_network_weaving(self) -> Dict:
+        """
+        Phase 3: Network Weaving - Map connections between entities and people
+        """
+        logging.info("=== PHASE 3: NETWORK WEAVING ===")
+        
+        results = {
+            'address_clusters': {},
+            'common_agents': {},
+            'connection_chains': []
+        }
+        
+        # Analyze address clusters
+        for address, entities in self.address_clusters.items():
+            if len(entities) > 1:  # Only show clusters with multiple entities
+                results['address_clusters'][address] = entities
+                
+                # Find all entities at this address from DB
+                cluster_entities = self.db.get_address_cluster(address)
+                logging.info(f"Address Cluster at {address}: {len(cluster_entities)} entities")
+        
+        # Find common statutory agents
+        cursor = self.db.conn.execute("""
+            SELECT statutory_agent, COUNT(*) as entity_count
+            FROM entities
+            WHERE statutory_agent IS NOT NULL AND statutory_agent != ''
+            GROUP BY statutory_agent
+            HAVING entity_count > 1
+            ORDER BY entity_count DESC
+        """)
+        
+        for row in cursor.fetchall():
+            agent, count = row
+            results['common_agents'][agent] = count
+            logging.info(f"Common Agent: {agent} represents {count} entities")
+        
+        return results
+    
+    def generate_report(self, investigation_id: str) -> str:
+        """
+        Generate a comprehensive investigation report
+        """
+        report = f"""
+        ==================== BACKDOOR INVESTIGATION REPORT ====================
+        Investigation ID: {investigation_id}
+        Date: {time.strftime('%Y-%m-%d %H:%M:%S')}
+        
+        SUMMARY STATISTICS:
+        - Entities Discovered: {len(self.known_entities)}
+        - People Identified: {len(self.known_people)}
+        - Address Clusters: {len(self.address_clusters)}
+        
+        KEY FINDINGS:
+        """
+        
+        # Add connection analysis
+        cursor = self.db.conn.execute("""
+            SELECT statutory_agent, GROUP_CONCAT(DISTINCT name) as entities
+            FROM entities
+            GROUP BY statutory_agent
+            HAVING COUNT(*) > 1
+        """)
+        
+        report += "\nCOMMON STATUTORY AGENTS (Network Hubs):\n"
+        for row in cursor.fetchall():
+            agent, entities = row
+            report += f"  • {agent}: {entities}\n"
+        
+        # Save report to file
+        report_path = f"{self.config.output_dir}/report_{investigation_id}.txt"
+        with open(report_path, 'w') as f:
+            f.write(report)
+        
+        return report_path
+
+# ==================== USAGE EXAMPLE ====================
+def run_investigation_example():
+    """Example of how to use the investigation framework"""
+    
+    # 1. Configure the investigator
+    config = InvestigatorConfig(
+        rate_limit_delay=3.0,  # Be respectful to public servers
+        output_dir="./wyloge_investigation",
+        db_path="./wyloge_network.db"
+    )
+    
+    # 2. Create investigator instance
+    investigator = BackdoorInvestigator(config)
+    
+    # 3. Phase 1: Foundation - Start with known entry points
+    print("Starting Phase 1: Foundation Research")
+    
+    # Search for primary targets
+    wyloge_results = investigator.phase1_foundation("Wyloge")
+    
+    # Search for associated entities found earlier
+    investigator.phase1_foundation("ATHB Brokerage")
+    investigator.phase1_foundation("Mark Manoil")  # The common agent
+    
+    # 4. Phase 2: Asset Mapping
+    print("\nStarting Phase 2: Asset Mapping")
+    
+    # Get entity IDs from Phase 1 results
+    entity_ids = list(investigator.known_entities)[:5]  # Limit for example
+    asset_results = investigator.phase2_asset_mapping(entity_ids)
+    
+    # 5. Phase 3: Network Weaving
+    print("\nStarting Phase 3: Network Weaving")
+    network_results = investigator.phase3_network_weaving()
+    
+    # 6. Generate Report
+    print("\nGenerating Final Report")
+    report_path = investigator.generate_report("WYLOGE_NETWORK_001")
+    
+    print(f"\nInvestigation complete! Report saved to: {report_path}")
+    
+    # 7. Output key findings
+    print("\n=== KEY FINDINGS ===")
+    print(f"Entities found: {len(investigator.known_entities)}")
+    print(f"People in network: {len(investigator.known_people)}")
+    
+    # Show top address clusters
+    print("\nTop Address Clusters:")
+    for address, entities in investigator.address_clusters.items():
+        if len(entities) > 2:  # Show significant clusters
+            print(f"  {address}: {', '.join(entities[:3])}...")
+
+# ==================== ETHICAL GUIDELINES CHECK ====================
+def display_ethical_guidelines():
+    """Display ethical and legal guidelines for using this tool"""
+    guidelines = """
+    ⚠️  ETHICAL AND LEGAL USAGE GUIDELINES ⚠️
+    
+    IMPORTANT: This tool is for educational and legitimate research purposes only.
+    
+    1. LEGAL COMPLIANCE:
+       - Only access PUBLICLY AVAILABLE information
+       - Do NOT bypass paywalls, login systems, or CAPTCHAs
+       - Respect robots.txt files and website terms of service
+       - Adhere to rate limits to avoid overwhelming servers
+    
+    2. ETHICAL USE CASES:
+       - Due diligence research
+       - Investigative journalism (with editorial oversight)
+       - Academic research
+       - Competitive intelligence (within legal bounds)
+    
+    3. PROHIBITED USES:
+       - Harassment or stalking individuals
+       - Identity theft or fraud
+       - Commercial spam generation
+       - Unauthorized surveillance
+    
+    4. DATA HANDLING:
+       - Securely store collected data
+       - Respect privacy expectations
+       - Delete data when no longer needed for legitimate purposes
+    
+    5. DISCLAIMER:
+       - This tool provides no warranty
+       - Users are solely responsible for legal compliance
+       - Consult with legal counsel if unsure about legitimacy
+    
+    By using this tool, you acknowledge and agree to these guidelines.
+    """
+    print(guidelines)
+
+# ==================== MAIN EXECUTION ====================
+if __name__ == "__main__":
+    # Always show ethical guidelines first
+    display_ethical_guidelines()
+    
+    # Ask for confirmation
+    response = input("\nDo you agree to these guidelines and intend to use this tool ethically? (yes/no): ")
+    
+    if response.lower() == 'yes':
+        print("\nStarting investigation framework...")
+        
+        # Create necessary directories
+        import os
+        os.makedirs("./investigation_data", exist_ok=True)
+        
+        # Run example investigation
+        run_investigation_example()
+    else:
+        print("Investigation cancelled. Please review the ethical guidelines.")
